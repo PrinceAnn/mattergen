@@ -3,7 +3,7 @@
 This folder contains a lightweight distillation pipeline that:
 
 1) Extracts **teacher features** from MatterGen (GemNet-T intermediate hidden states at chosen diffusion times `t`).
-2) Trains a **student** (CrysXPP / CGCNN-style graph model) with **supervised regression** + **feature distillation**.
+2) Trains a **student** (CrysXPP / CGCNN-style graph model or Gemnet) with **supervised regression** + **feature distillation**.
 
 The goal is to keep distillation code minimally coupled to the original repos:
 
@@ -37,27 +37,70 @@ Teacher features are stored as `npz`:
 ## How to run
 ### Teacher extraction
 ```bash
-python distill/mattergen_teacher/extract_mp20_features.py   --csv data-release/mp-20/unzipped/mp_20/val.csv   --out val_lastblock.npz   --blocks last
+python distill/mattergen_teacher/extract_mp20_features.py   --csv data-release/mp-20/unzipped/mp_20/val.csv   --out distill/teacher_features/train_lastblock.npz   --blocks last
 ```
 ### Student training
 
-```bash
- python distill/crysxpp_student/train_distill.py   --teacher-train train_lastblock.npz   --teacher-val val_lastblock.npz   --teacher-test test_lastblock.npz
-```
+#### Student A: CrysXPP (CGCNN-style)
+
 ```bash
 python distill/crysxpp_student/train_distill.py \
-  --teacher-train train_lastblock.npz \
-  --teacher-val val_lastblock.npz \
-  --teacher-test test_lastblock.npz \
+  --teacher-train distill/teacher_features/train_lastblock.npz \
+  --teacher-val distill/teacher_features/val_lastblock.npz \
+  --teacher-test distill/teacher_features/test_lastblock.npz \
   --target-property dft_band_gap \
   --out-dir distill/outputs/mp20_distill_dft_band_gap \
   --seed 42 > dft_band_gap_distil.log
-
-python distill/crysxpp_student/train_distill.py \
-  --teacher-train train_lastblock.npz \
-  --teacher-val val_lastblock.npz \
-  --teacher-test test_lastblock.npz \
-  --target-property e_above_hull \
-  --out-dir distill/outputs/mp20_distill_e_above_hull \
-  --seed 42 > e_above_hull_distil.log
 ```
+
+#### Student B: GemNet (MatterGen GemNetT backbone)
+
+This student uses MatterGen's original `GemNetT` architecture as the backbone.
+It builds the student representation to match the teacher feature format using
+the `t_values` and `blocks` stored in the teacher `.npz` metadata.
+
+
+```bash
+python distill/gemnet_student/train_distill.py \
+  --teacher-train distill/teacher_features/train_lastblock.npz \
+  --teacher-val distill/teacher_features/val_lastblock.npz \
+  --teacher-test distill/teacher_features/test_lastblock.npz \
+  --target-property formation_energy_per_atom \
+  --out-dir distill/outputs/mp20_distill_gemnet_formation_energy_per_atom \
+  --init-mattergen-ckpt checkpoints/mattergen_base/checkpoints/last.ckpt \
+  --device cuda --batch-size 32 --epochs 200
+  ```
+
+  ```bash
+  CUDA_VISIBLE_DEVICES=1 python distill/gemnet_student/train_distill.py \
+  --teacher-train distill/teacher_features/train_lastblock.npz \
+  --teacher-val distill/teacher_features/val_lastblock.npz \
+  --teacher-test distill/teacher_features/test_lastblock.npz \
+  --target-property dft_band_gap \
+  --out-dir distill/outputs/mp20_distill_gemnet_dft_band_gap \
+  --init-mattergen-ckpt checkpoints/mattergen_base/checkpoints/last.ckpt \
+  --device cuda --batch-size 32 --epochs 200
+  ```
+
+### Gemnet Baseline for student B
+
+  ```bash
+CUDA_VISIBLE_DEVICES=1 python distill/gemnet_student/train_baseline.py \
+  --target-property dft_band_gap \
+  --out-dir distill/outputs/mp20_baseline_gemnet_dft_band_gap \
+  --init-mattergen-ckpt checkpoints/mattergen_base/checkpoints/last.ckpt \
+  --device cuda --batch-size 32 --epochs 200
+  ``` 
+### Plot loss curves from logs
+  ```bash
+
+
+python plot_log_metrics.py \
+  mp20_distill_gemnet_formation_energy_per_atom.log \
+  mp20_baseline_gemnet_formation_energy_per_atom.log \
+  mp20_distill_nopretrain_gemnet_formation_energy_per_atom.log \
+  --metrics val_mae \
+  --max-epoch 100 \
+  --out distill/outputs/_plots/compare_3runs_val_mae_first100.png \
+  --title "Formation energy: val_mae (first 100 epochs)"
+  ```
