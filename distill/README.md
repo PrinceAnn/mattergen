@@ -1,16 +1,24 @@
 # MatterGen → CrysXPP distillation
 
+
 This folder contains a lightweight distillation pipeline that:
 
 1) Extracts **teacher features** from MatterGen (GemNet-T intermediate hidden states at chosen diffusion times `t`).
 2) Trains a **student** (CrysXPP / CGCNN-style graph model or Gemnet) with **supervised regression** + **feature distillation**.
 
-The goal is to keep distillation code minimally coupled to the original repos:
+## Data and checkpoints acquirement
 
-- Teacher extraction lives in `distill/mattergen_teacher/`.
-- Student training lives in `distill/crysxpp_student/`.
+First run these cmds to fetch and unzip datasets
+```bash
+git lfs install
+git lfs pull -I data-release/mp-20/ --exclude=""
+unzip ./data-release/mp-20/mp_20.zip -d ./data-release/mp-20/unzipped
+```
+then get the pretrained mattergen-base model checkpoint
+```bash
+git lfs pull -I checkpoints/mattergen_base --exclude="" 
+```
 
-## Data splits
 
 We follow the official MP-20 CSV splits from:
 
@@ -18,7 +26,6 @@ We follow the official MP-20 CSV splits from:
 - `data-release/mp-20/unzipped/mp_20/val.csv`
 - `data-release/mp-20/unzipped/mp_20/test.csv`
 
-Each CSV contains a `material_id` column and a `cif` column (CIF content as a string).
 
 ## Output feature format
 
