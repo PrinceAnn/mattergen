@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, MultiStepLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -80,6 +80,11 @@ class TrainConfig:
     optim: str
     weight_decay: float
     lr_milestones: list[int]
+    scheduler: str
+    warmup_ratio: float
+    min_lr: float
+    grad_clip: float
+    adamw_amsgrad: bool
     lambda_distill: float
     device: str
     limit: int | None
@@ -105,9 +110,40 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--optim", type=str, default="Adam", choices=["Adam", "SGD"])
+    p.add_argument("--optim", type=str, default="AdamW", choices=["AdamW", "Adam", "SGD"])
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--lr-milestones", type=int, nargs="+", default=[30, 40])
+
+    p.add_argument(
+        "--scheduler",
+        type=str,
+        default="cosine",
+        choices=["cosine", "multistep"],
+        help="LR scheduler. 'cosine' uses warmup+cosine anneal stepped per-iteration.",
+    )
+    p.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.06,
+        help="Warmup steps as ratio of total training steps (only used for cosine).",
+    )
+    p.add_argument(
+        "--min-lr",
+        type=float,
+        default=0.0,
+        help="Minimum LR for cosine scheduler (eta_min). 0.0 means anneal to 0.",
+    )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Global grad norm clip. Set <=0 to disable.",
+    )
+    p.add_argument(
+        "--adamw-amsgrad",
+        action="store_true",
+        help="Use AMSGrad variant for AdamW (can help stability sometimes).",
+    )
 
     p.add_argument("--lambda-distill", type=float, default=1.0)
 
@@ -174,6 +210,11 @@ def main() -> None:
         optim=str(args.optim),
         weight_decay=float(args.weight_decay),
         lr_milestones=list(args.lr_milestones),
+        scheduler=str(args.scheduler),
+        warmup_ratio=float(args.warmup_ratio),
+        min_lr=float(args.min_lr),
+        grad_clip=float(args.grad_clip),
+        adamw_amsgrad=bool(args.adamw_amsgrad),
         lambda_distill=float(args.lambda_distill),
         device=str(args.device),
         limit=int(args.limit) if args.limit is not None else None,
@@ -230,14 +271,33 @@ def main() -> None:
     params = list(model.parameters())
     if cfg.optim == "SGD":
         optimizer = optim.SGD(params, lr=cfg.lr, momentum=0.9, weight_decay=cfg.weight_decay)
-    else:
+    elif cfg.optim == "Adam":
         optimizer = optim.Adam(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    else:
+        optimizer = optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay, amsgrad=cfg.adamw_amsgrad)
 
-    scheduler = MultiStepLR(optimizer, milestones=cfg.lr_milestones, gamma=0.1)
+    # Scheduler
+    # - multistep: epoch-based (backward compatible)
+    # - cosine: warmup + cosine anneal (step-based)
+    total_steps = max(len(train_loader) * cfg.epochs, 1)
+    warmup_steps = int(round(cfg.warmup_ratio * total_steps)) if cfg.scheduler == "cosine" else 0
+
+    if cfg.scheduler == "multistep":
+        scheduler = MultiStepLR(optimizer, milestones=cfg.lr_milestones, gamma=0.1)
+    else:
+        # linear warmup from 0 -> 1 over warmup_steps
+        if warmup_steps > 0:
+            warmup = LambdaLR(optimizer, lr_lambda=lambda s: float(s + 1) / float(max(1, warmup_steps)))
+        else:
+            warmup = LambdaLR(optimizer, lr_lambda=lambda s: 1.0)
+        cosine_steps = max(total_steps - warmup_steps, 1)
+        cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=cfg.min_lr)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     best_val_mae = 1e9
+    global_step = 0
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -265,9 +325,18 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+
+            if cfg.grad_clip and cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg.grad_clip))
+
             optimizer.step()
 
-        scheduler.step()
+            if cfg.scheduler == "cosine":
+                scheduler.step()
+            global_step += 1
+
+        if cfg.scheduler == "multistep":
+            scheduler.step()
 
         val_loss, val_mae = evaluate(val_loader, model, criterion_sup, normalizer, device, desc=f"val epoch {epoch+1}/{cfg.epochs}")
         if val_mae < best_val_mae:
@@ -284,7 +353,10 @@ def main() -> None:
                 cfg.out_dir / "best.pt",
             )
 
-        print(f"epoch={epoch+1} val_loss={val_loss:.4f} val_mae={val_mae:.4f} best_val_mae={best_val_mae:.4f}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"epoch={epoch+1} lr={current_lr:.6g} val_loss={val_loss:.4f} val_mae={val_mae:.4f} best_val_mae={best_val_mae:.4f}"
+        )
 
     # final test eval
     ckpt = torch.load(cfg.out_dir / "best.pt", map_location=device)
